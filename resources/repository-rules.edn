@@ -7,4 +7,6 @@
   :tier :t3
   :role :runtime
   :must-not [:compile :decide-grants :require-Rust-in-the-core-path]
-  :depends-on ["kotoba-lang/kotoba-kir" "kotoba-lang/artifact" "kotoba-lang/kotoba-native"]}}
+  :depends-on ["kotoba-lang/kotoba-kir"
+               "kotoba-lang/artifact"
+               "kotoba-lang/kotoba-verifier"]}}
