@@ -1,10 +1,16 @@
 {:paths ["src" "resources"]
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
-        io.github.kotoba-lang/kotoba-kir {:git/url "https://github.com/kotoba-lang/kotoba-kir.git"
-                     :git/sha "2b741eaf551e94de95288c35646062ebfab0720f"}
-        io.github.kotoba-lang/artifact {:git/url "https://github.com/kotoba-lang/artifact.git"
-                   :git/sha "c544000a86ec85b1ecd6948587ed792ebf1f4de6"}
-        io.github.kotoba-lang/kotoba-native {:git/url "https://github.com/kotoba-lang/kotoba-native.git"
-                        :git/sha "f511714d465cbeced5fe77cb607acb79663c6f0e"}}
+        io.github.kotoba-lang/kotoba-kir
+        {:git/url "https://github.com/kotoba-lang/kotoba-kir.git"
+         :git/sha "031ff777fe186ab28e40510c0bac9370fd0a3eef"}
+        io.github.kotoba-lang/artifact
+        {:git/url "https://github.com/kotoba-lang/artifact.git"
+         :git/sha "da7654ad5e325291130462404d4a9c8e4c634580"}
+        io.github.kotoba-lang/kotoba-verifier
+        {:git/url "https://github.com/kotoba-lang/kotoba-verifier.git"
+         :git/sha "d5206abc16c4ec37eb074396e3108e12b86e1b62"}}
  :aliases {:test {:extra-paths ["test"]
+                  :extra-deps {io.github.cognitect-labs/test-runner
+                               {:git/url "https://github.com/cognitect-labs/test-runner.git"
+                                :git/sha "dfb30dd6605cb6c0efc275e1df1736f6e90d4d73"}}
                   :main-opts ["-m" "cognitect.test-runner"]}}}

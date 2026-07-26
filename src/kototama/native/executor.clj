@@ -5,7 +5,7 @@
             [kotoba.kir.admission :as admission]
             [kotoba.artifact.core :as artifact]
             [kotoba.artifact.runtime-identity :as runtime-identity]
-            [kotoba.artifact.signing :as signing]
+            [kotoba.verifier.signing :as signing]
             [kotoba.kir.target :as target-profile])
   (:import [java.nio.file Files LinkOption Path Paths]
            [java.lang ProcessHandle]
