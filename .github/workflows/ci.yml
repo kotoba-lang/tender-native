@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+      - run: clojure -M:test
+
+  # This repo's own suite is two tests. It is a library, and kotoba-lang/compiler
+  # consumes it through the :native-conformance alias, so the run that actually
+  # exercises it lives there -- T1.4 pure-native.
+  #
+  # Every kotoba-lang library CI carries a job like this, after kotoba-wasm
+  # f4d7afb was green on its own suite on 2026-07-30 and took the compiler from
+  # 52/52 conformance to 47/52.
+  consumer-conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dep
+      - name: Check out the consumer
+        run: git clone --depth 1 https://github.com/kotoba-lang/compiler compiler
+      - uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Compiler pure-native conformance against this checkout
+        working-directory: compiler
+        run: |
+          clojure -Sdeps "{:aliases {:dep {:override-deps {io.github.kotoba-lang/tender-native {:local/root \"../dep\"}}}}}" \
+            -M:dep:native-conformance
