@@ -617,8 +617,27 @@
               report (edn/read-string (str/trim (:stdout process)))
               trap (trap-value (:stderr process))
               status (:status report)
+              ;; Box a `:bool` entry's result at this boundary. `:bool` is a
+              ;; plain 0/1 word inside a module -- in the interpreter, in a
+              ;; wasm module, and in these backends' own setcc/cset sequences
+              ;; -- but the value that LEAVES a target is a host boolean
+              ;; (`kotoba-kir` 38d1bd0, 2026-07-31): wasm emits an export
+              ;; wrapper that boxes one, the restricted-ESM emitter returns
+              ;; one, and the reference interpreter boxes one so the shared
+              ;; corpora agree on the same value for a predicate. Native was
+              ;; the last target still handing back the word.
+              ;;
+              ;; The supervisor's own report is untouched and still carries the
+              ;; integer -- `valid-supervisor-report?` continues to require
+              ;; that, and `:report` is returned verbatim below. Only
+              ;; `:evidence :result`, the value a caller reads as the program's
+              ;; answer, is boxed.
+              bool-entry? (= :bool (get-in artifact [:program :signature :result]))
               evidence (cond-> {:status status :runtime runtime}
-                         (= status :ok) (assoc :result (:result report))
+                         (= status :ok)
+                         (assoc :result (if bool-entry?
+                                          (not (zero? (:result report)))
+                                          (:result report)))
                          trap (assoc :trap trap))]
           (when-not (valid-supervisor-report? report (:exit process))
             (throw (ex-info (str "malformed native supervisor evidence"
