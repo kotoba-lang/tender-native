@@ -542,6 +542,8 @@
                         {:phase :execute})))
       {"KEXE_STRUCTURED_REPORT" "1"})
      (= :string result-type) (assoc "KEXE_RESULT_TYPE" "string")
+     (contains? #{:option-i64 :result-i64} result-type)
+     (assoc "KEXE_RESULT_TYPE" (name result-type))
      (scalar-record-type? result-type)
      (assoc "KEXE_RESULT_TYPE" (str "record:" (record-field-count result-type))))))
 
@@ -593,6 +595,29 @@
                                             (get value field-name)))
                         fields)))))
 
+(defn- signed-i64? [value]
+  (and (integer? value) (<= Long/MIN_VALUE value Long/MAX_VALUE)))
+
+(defn- tagged-i64-argument-token [entry index type value]
+  (let [valid? (if (= type :option-i64)
+                 (and (vector? value)
+                      (or (= [false] value)
+                          (and (= 2 (count value)) (true? (first value))
+                               (signed-i64? (second value)))))
+                 (and (vector? value) (= 2 (count value))
+                      (boolean? (first value))
+                      (signed-i64? (second value))))]
+    (when-not valid?
+      (throw (ex-info "execution input does not match tagged i64 value"
+                      {:phase :execute :entry entry :index index
+                       :expected type})))
+    (case type
+      :option-i64 (if (false? (first value))
+                    "o:none"
+                    (str "o:some:" (second value)))
+      :result-i64 (str (if (true? (first value)) "e:ok:" "e:err:")
+                       (second value)))))
+
 (defn- decode-utf8-hex [value]
   (when (and (string? value) (even? (count value))
              (boolean (re-matches #"[0-9a-f]*" value)))
@@ -614,12 +639,18 @@
   (let [status (:status report)
         string-result? (and (= status :ok) (= :string (:result-type report)))
         record-result? (and (= status :ok) (= :record (:result-type report)))
+        tagged-result? (and (= status :ok)
+                            (contains? #{:option-i64 :result-i64}
+                                       (:result-type report)))
         expected-keys (case status
                         :ok (cond
                               string-result?
                               #{:status :result :result-type :result-utf8-hex :fuel :heap}
                               record-result?
                               #{:status :result :result-type :result-words :fuel :heap}
+                              tagged-result?
+                              #{:status :result :result-type :result-tag :result-word
+                                :fuel :heap}
                               :else #{:status :result :fuel :heap})
                         :trap #{:status :exit :fuel :heap}
                         nil)
@@ -643,7 +674,13 @@
                   (<= 1 (count (:result-words report)) 128)
                   (every? #(and (integer? %)
                                 (<= Long/MIN_VALUE % Long/MAX_VALUE))
-                          (:result-words report)))))))
+                          (:result-words report))))
+         (or (not tagged-result?)
+             (and (boolean? (:result-tag report))
+                  (signed-i64? (:result-word report))
+                  (or (not= :option-i64 (:result-type report))
+                      (:result-tag report)
+                      (zero? (:result-word report))))))))
 
 (defn- entry-contract
   "Return the selected export's typed function boundary.
@@ -690,6 +727,8 @@
                                     {:phase :execute :entry entry :index index
                                      :expected :bool})))
                   (= :string type) (string-argument-token entry index value)
+                  (contains? #{:option-i64 :result-i64} type)
+                  (tagged-i64-argument-token entry index type value)
                   (scalar-record-type? type) (record-argument-token entry index type value)
                   :else
                   (throw (ex-info "native execution host does not support entry parameter type"
@@ -714,10 +753,12 @@
 
 (defn- admit-entry-result! [entry result-type]
   ;; Handles never cross the process boundary. The measured loader copies a
-  ;; selected string or scalar record into typed report fields before exit;
+  ;; selected string, scalar record, option-i64, or result-i64 into typed
+  ;; report fields before exit;
   ;; every other aggregate remains closed until it has the same ownership and
   ;; validation story.
-  (when-not (or (contains? #{:i64 :bool :string} result-type)
+  (when-not (or (contains? #{:i64 :bool :string :option-i64 :result-i64}
+                           result-type)
                 (scalar-record-type? result-type))
     (throw (ex-info "native execution host does not support entry result type"
                     {:phase :execute :entry entry :type result-type}))))
@@ -734,6 +775,10 @@
     (or (decode-utf8-hex (:result-utf8-hex report))
         (throw (ex-info "native string result is not canonical UTF-8 hex"
                         {:phase :execute})))
+    (= :option-i64 result-type)
+    (if (:result-tag report) [true (:result-word report)] [false])
+    (= :result-i64 result-type)
+    [(:result-tag report) (:result-word report)]
     (scalar-record-type? result-type)
     (let [fields (nth result-type 2)
           words (:result-words report)]
