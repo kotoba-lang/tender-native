@@ -16,3 +16,43 @@
     (is (false? (valid? (assoc-in ok [:fuel :remaining] 513) 0)))
     (is (false? (valid? (assoc ok :ambient "forbidden") 0)))
     (is (false? (valid? ok 1)))))
+
+(deftest entryless-export-contract-is-read-from-the-selected-function
+  (let [contract @#'executor/entry-contract
+        artifact {:program {:functions [{:name 'choose
+                                         :params ['enabled 'value]
+                                         :param-types [:bool :i64]
+                                         :result :i64}
+                                        {:name 'negate
+                                         :params ['value]
+                                         :param-types [:bool]
+                                         :result :bool}]}}]
+    (is (= {:param-types [:bool :i64] :result :i64}
+           (contract artifact 'choose)))
+    (is (= {:param-types [:bool] :result :bool}
+           (contract artifact 'negate)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no unique typed function"
+                          (contract artifact 'missing)))))
+
+(deftest bool-and-i64-host-values-remain-distinct
+  (let [marshal @#'executor/marshal-entry-arguments]
+    (is (= [1 41] (marshal 'choose [:bool :i64] [true 41])))
+    (is (= [0 Long/MIN_VALUE]
+           (marshal 'choose [:bool :i64] [false Long/MIN_VALUE])))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"entry arguments"
+                          (marshal 'choose [:bool :i64] [1 41])))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"entry arguments"
+                          (marshal 'choose [:bool :i64] [true true])))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"parameter type"
+                          (marshal 'echo [:string] ["hello"])))))
+
+(deftest selected-export-result-is-boxed-or-refused-by-type
+  (let [admit! @#'executor/admit-entry-result!
+        host-result @#'executor/host-result]
+    (is (= 7 (host-result :i64 7)))
+    (is (true? (host-result :bool 1)))
+    (is (false? (host-result :bool 0)))
+    (is (nil? (admit! 'choose :i64)))
+    (is (nil? (admit! 'negate :bool)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"result type"
+                          (admit! 'label :string)))))

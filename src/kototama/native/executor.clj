@@ -544,6 +544,62 @@
          (or (not= status :trap) (= exit (:exit report)))
          (or (not= status :ok) (integer? (:result report))))))
 
+(defn- entry-contract
+  "Return the selected export's typed function boundary.
+
+  `artifact :exports` owns machine offsets and arities; the sealed KIR program
+  owns value types.  The entry-bearing `:signature` is not sufficient for a
+  library because it is nil there, and it describes only `main` when present."
+  [artifact entry]
+  (let [matches (filter #(= entry (:name %)) (get-in artifact [:program :functions]))
+        function (first matches)]
+    (when-not (= 1 (count matches))
+      (throw (ex-info "selected native export has no unique typed function"
+                      {:phase :execute :entry entry})))
+    {:param-types (or (:param-types function)
+                      (vec (repeat (count (:params function)) :i64)))
+     :result (:result function)}))
+
+(defn- marshal-entry-arguments
+  "Validate host values against the selected export and lower them to loader
+  words.  A Kotoba `:bool` is a real host boolean at the public boundary and a
+  0/1 word only inside native code; accepting integer 0/1 here would erase the
+  type distinction that the reference, Wasm and restricted-ESM hosts preserve."
+  [entry param-types args]
+  (when-not (and (vector? args)
+                 (= (count param-types) (count args))
+                 (<= (count args) 5))
+    (throw (ex-info "execution input does not match entry arguments (entry arity)"
+                    {:phase :execute :entry entry
+                     :arity (count param-types)})))
+  (mapv (fn [index type value]
+          (case type
+            :i64 (if (and (integer? value)
+                          (<= Long/MIN_VALUE value Long/MAX_VALUE))
+                   value
+                   (throw (ex-info "execution input does not match entry arguments (entry arity)"
+                                   {:phase :execute :entry entry :index index
+                                    :expected :i64})))
+            :bool (if (boolean? value)
+                    (if value 1 0)
+                    (throw (ex-info "execution input does not match entry arguments (entry arity)"
+                                    {:phase :execute :entry entry :index index
+                                     :expected :bool})))
+            (throw (ex-info "native execution host does not support entry parameter type"
+                            {:phase :execute :entry entry :index index :type type}))))
+        (range) param-types args))
+
+(defn- admit-entry-result! [entry result-type]
+  ;; A native string is an arena-owned (offset,length) handle.  The current
+  ;; process-per-call loader exits before the host can copy that arena, so
+  ;; reporting the handle as an integer would be a plausible-looking lie.
+  (when-not (contains? #{:i64 :bool} result-type)
+    (throw (ex-info "native execution host does not support entry result type"
+                    {:phase :execute :entry entry :type result-type}))))
+
+(defn- host-result [result-type word]
+  (if (= :bool result-type) (not (zero? word)) word))
+
 (defn execute
   "Verify and execute a signed native artifact. Returns measured supervisor evidence."
   [envelope trust policy input {:keys [now entry runtime loader-path]}]
@@ -564,11 +620,16 @@
                        :host-target host-backend})))
     (when-not export
       (throw (ex-info "unknown native entry" {:phase :execute :entry entry})))
-    (when-not (and (map? input) (vector? args) (every? integer? args)
-                   (every? #(<= Long/MIN_VALUE % Long/MAX_VALUE) args)
-                   (= (:arity export) (count args)) (<= (count args) 5))
-      (throw (ex-info "execution input does not match entry arity"
+    (let [{:keys [param-types result]} (entry-contract artifact entry)]
+    (when-not (map? input)
+      (throw (ex-info "execution input does not match entry arguments (entry arity)"
                       {:phase :execute :entry entry :arity (:arity export)})))
+    (when-not (= (:arity export) (count param-types))
+      (throw (ex-info "native export arity disagrees with sealed KIR"
+                      {:phase :execute :entry entry :export-arity (:arity export)
+                       :kir-arity (count param-types)})))
+    (let [args (marshal-entry-arguments entry param-types args)]
+      (admit-entry-result! entry result)
     (when-not (= (target-profile/profile (explicit-host-target)) runtime-profile)
       (throw (ex-info "runtime target profile does not match execution host"
                       {:phase :runtime-identity})))
@@ -632,12 +693,9 @@
               ;; that, and `:report` is returned verbatim below. Only
               ;; `:evidence :result`, the value a caller reads as the program's
               ;; answer, is boxed.
-              bool-entry? (= :bool (get-in artifact [:program :signature :result]))
               evidence (cond-> {:status status :runtime runtime}
                          (= status :ok)
-                         (assoc :result (if bool-entry?
-                                          (not (zero? (:result report)))
-                                          (:result report)))
+                         (assoc :result (host-result result (:result report)))
                          trap (assoc :trap trap))]
           (when-not (valid-supervisor-report? report (:exit process))
             (throw (ex-info (str "malformed native supervisor evidence"
@@ -651,4 +709,4 @@
           {:artifact artifact :signer signer :target (:target artifact) :entry entry
            :input input :evidence evidence :report report
            :started-at started-at :finished-at finished-at})
-        (finally (delete-tree! directory)))))))
+        (finally (delete-tree! directory)))))))))
