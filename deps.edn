@@ -5,7 +5,7 @@
          :git/sha "b6d84179a87a12e3de8c5b932127494e8b15b175"}
         io.github.kotoba-lang/artifact
         {:git/url "https://github.com/kotoba-lang/artifact.git"
-         :git/sha "b50572b51ca95c51c22856ba69a77b7fe6f99790"}
+         :git/sha "aa3e4486a13098adcb92c245de2aa1124c9b86c5"}
         io.github.kotoba-lang/kotoba-verifier
         {:git/url "https://github.com/kotoba-lang/kotoba-verifier.git"
          :git/sha "ef5d93d628d33b3101e6e487c6eed22f19e19a01"}}

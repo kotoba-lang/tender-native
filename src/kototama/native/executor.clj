@@ -508,6 +508,20 @@
                       (or stderr ""))]
     (str stage (when win32 (str "/win32=" win32)))))
 
+(defn- scalar-record-type? [type]
+  (and (vector? type) (= 3 (count type)) (= :record (first type))
+       (keyword? (second type))
+       (let [fields (nth type 2)]
+         (and (vector? fields) (<= 1 (count fields) 128)
+              (every? #(and (vector? %) (= 2 (count %))
+                            (keyword? (first %))
+                            (contains? #{:i64 :bool} (second %)))
+                      fields)
+              (= (count fields) (count (distinct (map first fields))))))))
+
+(defn- record-field-count [type]
+  (when (scalar-record-type? type) (count (nth type 2))))
+
 (defn- runtime-environment
   ([host-os-value] (runtime-environment host-os-value :i64))
   ([host-os-value result-type]
@@ -527,7 +541,9 @@
         (throw (ex-info "Windows native execution requires SystemRoot"
                         {:phase :execute})))
       {"KEXE_STRUCTURED_REPORT" "1"})
-     (= :string result-type) (assoc "KEXE_RESULT_TYPE" "string"))))
+     (= :string result-type) (assoc "KEXE_RESULT_TYPE" "string")
+     (scalar-record-type? result-type)
+     (assoc "KEXE_RESULT_TYPE" (str "record:" (record-field-count result-type))))))
 
 (def ^:private hex-digits "0123456789abcdef")
 
@@ -550,6 +566,33 @@
                        :limit-bytes 65536})))
     (str "s:" (bytes->hex bytes))))
 
+(defn- scalar-host-word [entry index field-name type value]
+  (case type
+    :i64 (if (and (integer? value) (<= Long/MIN_VALUE value Long/MAX_VALUE))
+           value
+           (throw (ex-info "execution input does not match record field"
+                           {:phase :execute :entry entry :index index
+                            :field field-name :expected :i64})))
+    :bool (if (boolean? value)
+            (if value 1 0)
+            (throw (ex-info "execution input does not match record field"
+                            {:phase :execute :entry entry :index index
+                             :field field-name :expected :bool})))))
+
+(defn- record-argument-token [entry index type value]
+  (let [fields (nth type 2)
+        names (mapv first fields)]
+    (when-not (and (map? value) (= (set names) (set (keys value))))
+      (throw (ex-info "execution input does not match record fields"
+                      {:phase :execute :entry entry :index index
+                       :expected names})))
+    (str "r:"
+         (str/join ","
+                   (map (fn [[field-name field-type]]
+                          (scalar-host-word entry index field-name field-type
+                                            (get value field-name)))
+                        fields)))))
+
 (defn- decode-utf8-hex [value]
   (when (and (string? value) (even? (count value))
              (boolean (re-matches #"[0-9a-f]*" value)))
@@ -570,10 +613,14 @@
 (defn- valid-supervisor-report? [report exit]
   (let [status (:status report)
         string-result? (and (= status :ok) (= :string (:result-type report)))
+        record-result? (and (= status :ok) (= :record (:result-type report)))
         expected-keys (case status
-                        :ok (if string-result?
+                        :ok (cond
+                              string-result?
                               #{:status :result :result-type :result-utf8-hex :fuel :heap}
-                              #{:status :result :fuel :heap})
+                              record-result?
+                              #{:status :result :result-type :result-words :fuel :heap}
+                              :else #{:status :result :fuel :heap})
                         :trap #{:status :exit :fuel :heap}
                         nil)
         fuel (:fuel report)
@@ -590,7 +637,13 @@
          (or (not= status :trap) (= exit (:exit report)))
          (or (not= status :ok) (integer? (:result report)))
          (or (not string-result?)
-             (some? (decode-utf8-hex (:result-utf8-hex report)))))))
+             (some? (decode-utf8-hex (:result-utf8-hex report))))
+         (or (not record-result?)
+             (and (vector? (:result-words report))
+                  (<= 1 (count (:result-words report)) 128)
+                  (every? #(and (integer? %)
+                                (<= Long/MIN_VALUE % Long/MAX_VALUE))
+                          (:result-words report)))))))
 
 (defn- entry-contract
   "Return the selected export's typed function boundary.
@@ -622,19 +675,23 @@
                      :arity (count param-types)})))
   (let [marshalled
         (mapv (fn [index type value]
-                (case type
-                  :i64 (if (and (integer? value)
-                                (<= Long/MIN_VALUE value Long/MAX_VALUE))
-                         value
-                         (throw (ex-info "execution input does not match entry arguments (entry arity)"
-                                         {:phase :execute :entry entry :index index
-                                          :expected :i64})))
-                  :bool (if (boolean? value)
-                          (if value 1 0)
-                          (throw (ex-info "execution input does not match entry arguments (entry arity)"
-                                          {:phase :execute :entry entry :index index
-                                           :expected :bool})))
-                  :string (string-argument-token entry index value)
+                (cond
+                  (= :i64 type)
+                  (if (and (integer? value)
+                           (<= Long/MIN_VALUE value Long/MAX_VALUE))
+                    value
+                    (throw (ex-info "execution input does not match entry arguments (entry arity)"
+                                    {:phase :execute :entry entry :index index
+                                     :expected :i64})))
+                  (= :bool type)
+                  (if (boolean? value)
+                    (if value 1 0)
+                    (throw (ex-info "execution input does not match entry arguments (entry arity)"
+                                    {:phase :execute :entry entry :index index
+                                     :expected :bool})))
+                  (= :string type) (string-argument-token entry index value)
+                  (scalar-record-type? type) (record-argument-token entry index type value)
+                  :else
                   (throw (ex-info "native execution host does not support entry parameter type"
                                   {:phase :execute :entry entry :index index :type type}))))
               (range) param-types args)
@@ -643,28 +700,54 @@
                                     (if (= :string type)
                                       (quot (- (count token) 2) 2)
                                       0))
-                                  param-types marshalled))]
+                                  param-types marshalled))
+        record-cells (reduce + 0 (keep record-field-count param-types))]
     (when (> string-bytes 65536)
       (throw (ex-info "execution string inputs exceed native host arena"
                       {:phase :execute :entry entry :bytes string-bytes
                        :limit-bytes 65536})))
+    (when (> record-cells 4096)
+      (throw (ex-info "execution record inputs exceed native pair arena"
+                      {:phase :execute :entry entry :cells record-cells
+                       :limit-cells 4096})))
     marshalled))
 
 (defn- admit-entry-result! [entry result-type]
-  ;; A native string is an arena-owned (offset,length) handle.  The current
-  ;; process-per-call loader exits before the host can copy that arena, so
-  ;; reporting the handle as an integer would be a plausible-looking lie.
-  (when-not (contains? #{:i64 :bool :string} result-type)
+  ;; Handles never cross the process boundary. The measured loader copies a
+  ;; selected string or scalar record into typed report fields before exit;
+  ;; every other aggregate remains closed until it has the same ownership and
+  ;; validation story.
+  (when-not (or (contains? #{:i64 :bool :string} result-type)
+                (scalar-record-type? result-type))
     (throw (ex-info "native execution host does not support entry result type"
                     {:phase :execute :entry entry :type result-type}))))
 
 (defn- host-result [result-type report]
-  (case result-type
-    :bool (not (zero? (:result report)))
-    :string (or (decode-utf8-hex (:result-utf8-hex report))
-                (throw (ex-info "native string result is not canonical UTF-8 hex"
-                                {:phase :execute})))
-    (:result report)))
+  (cond
+    (= :bool result-type) (not (zero? (:result report)))
+    (= :string result-type)
+    (or (decode-utf8-hex (:result-utf8-hex report))
+        (throw (ex-info "native string result is not canonical UTF-8 hex"
+                        {:phase :execute})))
+    (scalar-record-type? result-type)
+    (let [fields (nth result-type 2)
+          words (:result-words report)]
+      (when-not (= (count fields) (count words))
+        (throw (ex-info "native record result field count mismatch"
+                        {:phase :execute :expected (count fields)
+                         :actual (count words)})))
+      (into {}
+            (map (fn [[field-name field-type] word]
+                   [field-name
+                    (case field-type
+                      :i64 word
+                      :bool (if (contains? #{0 1} word)
+                              (= 1 word)
+                              (throw (ex-info "native record bool field is not 0/1"
+                                              {:phase :execute :field field-name
+                                               :word word}))))])
+                 fields words)))
+    :else (:result report)))
 
 (defn execute
   "Verify and execute a signed native artifact. Returns measured supervisor evidence."

@@ -18,13 +18,18 @@ checkable from outside.
   arena before guest entry. Selected `:string` results are independently
   validated and copied from that arena into the structured report before the
   process exits; pair handles never escape as host strings.
+- Scalar `:record` parameters and selected results use the published aggregate
+  ABI's declaration-order pair chain. The host accepts exactly the declared
+  keyword keys, supports only unique `:i64`/`:bool` fields (1–128), and the
+  loader requires the exact chain length and zero terminator before copying
+  field words into evidence. Pair handles never escape to callers.
 
 ## Does not own
 
 - compile
 - decide grants
 - require Rust in the core path
-- expose aggregate, vector, option, result, record, or document handles as host
+- expose nested aggregate, vector, option, result, or document handles as host
   values. Those boundaries remain explicitly rejected until each has a bounded
   copy/validation protocol.
 
