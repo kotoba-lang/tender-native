@@ -388,13 +388,39 @@
        sort
        (str/join ",")))
 
-(defn- build-runtime! [directory]
+(defn- loader-source-file
+  "Locate the reviewed loader source.
+
+  It used to be read as `tools/<name>` relative to the process working
+  directory, which is only correct when that directory happens to be the
+  compiler repository that owns the file. Every other host -- a library with a
+  native decision, a service, a test suite in another repo -- got
+  `NoSuchFileException: tools/kexe_loader.c` and no way to say where it is.
+
+  So the directory is now nameable, by `:loader-source-dir` or by
+  `KOTOBA_LOADER_SOURCE_DIR`, and `tools/` under the working directory stays
+  the last candidate so existing callers are unaffected. Naming a directory
+  cannot smuggle in a different loader: `build-runtime!` still refuses any
+  source whose digest is not the reviewed one for this target profile."
+  [windows? source-dir]
+  (let [file-name (if windows? "kexe_loader_windows.c" "kexe_loader.c")
+        directories (remove str/blank?
+                            [source-dir
+                             (System/getenv "KOTOBA_LOADER_SOURCE_DIR")
+                             "tools"])
+        candidates (map #(io/file % file-name) directories)]
+    (or (first (filter #(.isFile ^java.io.File %) candidates))
+        (throw (ex-info "reviewed native loader source was not found"
+                        {:phase :execute :file file-name
+                         :searched (mapv #(.getPath ^java.io.File %) candidates)
+                         :name-it :loader-source-dir})))))
+
+(defn- build-runtime! [directory source-dir]
   (let [windows? (= :windows (host-os))
         loader (io/file directory (if windows? "kexe-loader.exe" "kexe-loader"))
         dependency-file (io/file directory "loader.d")
         dependency-object (io/file directory "loader-deps.o")
-        loader-source (io/file (if windows? "tools/kexe_loader_windows.c"
-                                   "tools/kexe_loader.c"))
+        loader-source (loader-source-file windows? source-dir)
         expected-source-sha (runtime-identity/loader-source-for-profile
                              (target-profile/profile (explicit-host-target)))
         compiler-path (resolve-executable (if windows? "clang" "cc"))
@@ -487,16 +513,21 @@
                    :system-header-closure-sha256 dependency-sha}}))))
 
 (defn measure-runtime
-  "Build the reviewed loader twice and return its identity and exact bytes."
-  []
+  "Build the reviewed loader twice and return its identity and exact bytes.
+
+  `:loader-source-dir` says where the reviewed source is; without it, the
+  `KOTOBA_LOADER_SOURCE_DIR` environment variable and then `tools/` under the
+  working directory are tried, in that order."
+  ([] (measure-runtime {}))
+  ([{:keys [loader-source-dir]}]
   ;; Refuse unsupported hosts here, before invoking a host toolchain.
   (host-target)
   (let [directory (.toFile (Files/createTempDirectory
                             "kotoba-measure-" (make-array FileAttribute 0)))]
     (try
-      (let [{:keys [loader runtime]} (build-runtime! directory)]
+      (let [{:keys [loader runtime]} (build-runtime! directory loader-source-dir)]
         {:runtime runtime :loader-bytes (Files/readAllBytes (.toPath ^java.io.File loader))})
-      (finally (delete-tree! directory)))))
+      (finally (delete-tree! directory))))))
 
 (defn- trap-value [stderr]
   (when-let [[_ value] (re-find #"(?m)^KEXE_TRAP (\{.*\})$" stderr)]

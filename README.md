@@ -50,6 +50,12 @@ checkable from outside.
   the split is the difference between native being an execution path and
   native being a conformance target.
 
+- Locating the reviewed loader source. `measure-runtime` takes
+  `:loader-source-dir`, falls back to `KOTOBA_LOADER_SOURCE_DIR`, and only
+  then to `tools/` under the working directory. Naming a directory cannot
+  substitute a different loader: the source digest must still be the reviewed
+  one for the target profile.
+
 ## Does not own
 
 - compile
