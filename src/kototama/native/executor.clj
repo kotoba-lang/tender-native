@@ -724,7 +724,12 @@
 
 (defn- host-result [result-type report]
   (cond
-    (= :bool result-type) (not (zero? (:result report)))
+    (= :bool result-type)
+    (case (:result report)
+      0 false
+      1 true
+      (throw (ex-info "native bool result is not 0/1"
+                      {:phase :execute :word (:result report)})))
     (= :string result-type)
     (or (decode-utf8-hex (:result-utf8-hex report))
         (throw (ex-info "native string result is not canonical UTF-8 hex"
