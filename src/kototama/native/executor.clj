@@ -7,9 +7,10 @@
             [kotoba.artifact.runtime-identity :as runtime-identity]
             [kotoba.verifier.signing :as signing]
             [kotoba.kir.target :as target-profile])
-  (:import [java.nio.file Files LinkOption Path Paths]
+  (:import [java.nio ByteBuffer]
+           [java.nio.file Files LinkOption Path Paths]
            [java.lang ProcessHandle]
-           [java.nio.charset StandardCharsets]
+           [java.nio.charset CodingErrorAction StandardCharsets]
            [java.nio.file.attribute FileAttribute]
            [java.io ByteArrayOutputStream]
            [java.security MessageDigest]
@@ -507,27 +508,72 @@
                       (or stderr ""))]
     (str stage (when win32 (str "/win32=" win32)))))
 
-(defn- runtime-environment [host-os-value]
-  (if (= :windows host-os-value)
-    (if-let [system-root (or (System/getenv "SystemRoot")
-                             (System/getenv "WINDIR"))]
-      (if-let [local-app-data (System/getenv "LOCALAPPDATA")]
-        {"KEXE_STRUCTURED_REPORT" "1"
-         "SystemRoot" system-root
-         ;; CreateProcessW uses this to materialize the per-profile
-         ;; AppContainer environment. Do not inherit the rest of the user's
-         ;; environment (PATH, credentials, or arbitrary injection knobs).
-         "LOCALAPPDATA" local-app-data}
-        (throw (ex-info "Windows AppContainer execution requires LOCALAPPDATA"
+(defn- runtime-environment
+  ([host-os-value] (runtime-environment host-os-value :i64))
+  ([host-os-value result-type]
+   (cond->
+    (if (= :windows host-os-value)
+      (if-let [system-root (or (System/getenv "SystemRoot")
+                               (System/getenv "WINDIR"))]
+        (if-let [local-app-data (System/getenv "LOCALAPPDATA")]
+          {"KEXE_STRUCTURED_REPORT" "1"
+           "SystemRoot" system-root
+           ;; CreateProcessW uses this to materialize the per-profile
+           ;; AppContainer environment. Do not inherit the rest of the user's
+           ;; environment (PATH, credentials, or arbitrary injection knobs).
+           "LOCALAPPDATA" local-app-data}
+          (throw (ex-info "Windows AppContainer execution requires LOCALAPPDATA"
+                          {:phase :execute})))
+        (throw (ex-info "Windows native execution requires SystemRoot"
                         {:phase :execute})))
-      (throw (ex-info "Windows native execution requires SystemRoot"
-                      {:phase :execute})))
-    {"KEXE_STRUCTURED_REPORT" "1"}))
+      {"KEXE_STRUCTURED_REPORT" "1"})
+     (= :string result-type) (assoc "KEXE_RESULT_TYPE" "string"))))
+
+(def ^:private hex-digits "0123456789abcdef")
+
+(defn- bytes->hex [bytes]
+  (let [out (StringBuilder. (* 2 (alength ^bytes bytes)))]
+    (doseq [byte bytes]
+      (let [value (bit-and (int byte) 0xff)]
+        (.append out (.charAt hex-digits (unsigned-bit-shift-right value 4)))
+        (.append out (.charAt hex-digits (bit-and value 0x0f)))))
+    (str out)))
+
+(defn- string-argument-token [entry index value]
+  (when-not (string? value)
+    (throw (ex-info "execution input does not match entry arguments (entry arity)"
+                    {:phase :execute :entry entry :index index :expected :string})))
+  (let [bytes (.getBytes ^String value StandardCharsets/UTF_8)]
+    (when (> (alength bytes) 65536)
+      (throw (ex-info "execution string input exceeds native host arena"
+                      {:phase :execute :entry entry :index index
+                       :limit-bytes 65536})))
+    (str "s:" (bytes->hex bytes))))
+
+(defn- decode-utf8-hex [value]
+  (when (and (string? value) (even? (count value))
+             (boolean (re-matches #"[0-9a-f]*" value)))
+    (try
+      (let [bytes (byte-array (quot (count value) 2))]
+        (dotimes [index (alength bytes)]
+          (aset-byte bytes index
+                     (unchecked-byte
+                      (Integer/parseInt (.substring ^String value
+                                                    (* 2 index) (+ (* 2 index) 2))
+                                        16))))
+        (let [decoder (doto (.newDecoder StandardCharsets/UTF_8)
+                        (.onMalformedInput CodingErrorAction/REPORT)
+                        (.onUnmappableCharacter CodingErrorAction/REPORT))]
+          (str (.decode decoder (ByteBuffer/wrap bytes)))))
+      (catch Exception _ nil))))
 
 (defn- valid-supervisor-report? [report exit]
   (let [status (:status report)
+        string-result? (and (= status :ok) (= :string (:result-type report)))
         expected-keys (case status
-                        :ok #{:status :result :fuel :heap}
+                        :ok (if string-result?
+                              #{:status :result :result-type :result-utf8-hex :fuel :heap}
+                              #{:status :result :fuel :heap})
                         :trap #{:status :exit :fuel :heap}
                         nil)
         fuel (:fuel report)
@@ -542,7 +588,9 @@
          (= 4096 (:capacity heap))
          (integer? (:used heap)) (<= 0 (:used heap) 4096)
          (or (not= status :trap) (= exit (:exit report)))
-         (or (not= status :ok) (integer? (:result report))))))
+         (or (not= status :ok) (integer? (:result report)))
+         (or (not string-result?)
+             (some? (decode-utf8-hex (:result-utf8-hex report)))))))
 
 (defn- entry-contract
   "Return the selected export's typed function boundary.
@@ -572,33 +620,51 @@
     (throw (ex-info "execution input does not match entry arguments (entry arity)"
                     {:phase :execute :entry entry
                      :arity (count param-types)})))
-  (mapv (fn [index type value]
-          (case type
-            :i64 (if (and (integer? value)
-                          (<= Long/MIN_VALUE value Long/MAX_VALUE))
-                   value
-                   (throw (ex-info "execution input does not match entry arguments (entry arity)"
-                                   {:phase :execute :entry entry :index index
-                                    :expected :i64})))
-            :bool (if (boolean? value)
-                    (if value 1 0)
-                    (throw (ex-info "execution input does not match entry arguments (entry arity)"
-                                    {:phase :execute :entry entry :index index
-                                     :expected :bool})))
-            (throw (ex-info "native execution host does not support entry parameter type"
-                            {:phase :execute :entry entry :index index :type type}))))
-        (range) param-types args))
+  (let [marshalled
+        (mapv (fn [index type value]
+                (case type
+                  :i64 (if (and (integer? value)
+                                (<= Long/MIN_VALUE value Long/MAX_VALUE))
+                         value
+                         (throw (ex-info "execution input does not match entry arguments (entry arity)"
+                                         {:phase :execute :entry entry :index index
+                                          :expected :i64})))
+                  :bool (if (boolean? value)
+                          (if value 1 0)
+                          (throw (ex-info "execution input does not match entry arguments (entry arity)"
+                                          {:phase :execute :entry entry :index index
+                                           :expected :bool})))
+                  :string (string-argument-token entry index value)
+                  (throw (ex-info "native execution host does not support entry parameter type"
+                                  {:phase :execute :entry entry :index index :type type}))))
+              (range) param-types args)
+        string-bytes (reduce + 0
+                             (map (fn [type token]
+                                    (if (= :string type)
+                                      (quot (- (count token) 2) 2)
+                                      0))
+                                  param-types marshalled))]
+    (when (> string-bytes 65536)
+      (throw (ex-info "execution string inputs exceed native host arena"
+                      {:phase :execute :entry entry :bytes string-bytes
+                       :limit-bytes 65536})))
+    marshalled))
 
 (defn- admit-entry-result! [entry result-type]
   ;; A native string is an arena-owned (offset,length) handle.  The current
   ;; process-per-call loader exits before the host can copy that arena, so
   ;; reporting the handle as an integer would be a plausible-looking lie.
-  (when-not (contains? #{:i64 :bool} result-type)
+  (when-not (contains? #{:i64 :bool :string} result-type)
     (throw (ex-info "native execution host does not support entry result type"
                     {:phase :execute :entry entry :type result-type}))))
 
-(defn- host-result [result-type word]
-  (if (= :bool result-type) (not (zero? word)) word))
+(defn- host-result [result-type report]
+  (case result-type
+    :bool (not (zero? (:result report)))
+    :string (or (decode-utf8-hex (:result-utf8-hex report))
+                (throw (ex-info "native string result is not canonical UTF-8 hex"
+                                {:phase :execute})))
+    (:result report)))
 
 (defn execute
   "Verify and execute a signed native artifact. Returns measured supervisor evidence."
@@ -671,13 +737,23 @@
                              (str (:offset export)) (str (:arity export)) isa allow]
                             (map str args))
               started-at (quot (System/currentTimeMillis) 1000)
-              process (run-process command (runtime-environment host-os-value)
+              process (run-process command (runtime-environment host-os-value result)
                                    {:timeout-ms (if (= :windows host-os-value) 60000 5000)
-                                    :output-limit 65536})
+                                    :output-limit (if (= :string result) 160000 65536)})
               finished-at (quot (System/currentTimeMillis) 1000)
               report (edn/read-string (str/trim (:stdout process)))
               trap (trap-value (:stderr process))
               status (:status report)
+              _ (when-not (valid-supervisor-report? report (:exit process))
+                  (throw (ex-info (str "malformed native supervisor evidence"
+                                       " (exit=" (:exit process)
+                                       ", timed-out=" (:timed-out? process)
+                                       ", output-exceeded=" (:output-exceeded? process)
+                                       ", report-status=" status
+                                       ", loader-failure="
+                                       (loader-failure-class (:stderr process)) ")")
+                                  {:phase :execute :exit (:exit process)
+                                   :stdout (:stdout process) :stderr (:stderr process)})))
               ;; Box a `:bool` entry's result at this boundary. `:bool` is a
               ;; plain 0/1 word inside a module -- in the interpreter, in a
               ;; wasm module, and in these backends' own setcc/cset sequences
@@ -695,17 +771,8 @@
               ;; answer, is boxed.
               evidence (cond-> {:status status :runtime runtime}
                          (= status :ok)
-                         (assoc :result (host-result result (:result report)))
+                         (assoc :result (host-result result report))
                          trap (assoc :trap trap))]
-          (when-not (valid-supervisor-report? report (:exit process))
-            (throw (ex-info (str "malformed native supervisor evidence"
-                                 " (exit=" (:exit process)
-                                 ", timed-out=" (:timed-out? process)
-                                 ", output-exceeded=" (:output-exceeded? process)
-                                 ", report-status=" status
-                                 ", loader-failure=" (loader-failure-class (:stderr process)) ")")
-                            {:phase :execute :exit (:exit process)
-                             :stdout (:stdout process) :stderr (:stderr process)})))
           {:artifact artifact :signer signer :target (:target artifact) :entry entry
            :input input :evidence evidence :report report
            :started-at started-at :finished-at finished-at})

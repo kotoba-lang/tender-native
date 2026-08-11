@@ -14,15 +14,19 @@ checkable from outside.
 - The selected export's typed host boundary. `:bool` parameters accept host
   booleans and lower to native 0/1 words; `:bool` results return host booleans.
   `:i64` remains distinct and accepts integers only.
+- `:string` parameters are canonical UTF-8 copied into the bounded native
+  arena before guest entry. Selected `:string` results are independently
+  validated and copied from that arena into the structured report before the
+  process exits; pair handles never escape as host strings.
 
 ## Does not own
 
 - compile
 - decide grants
 - require Rust in the core path
-- pretend arena-owned native string handles are host strings. The current
-  process-per-call loader rejects string parameters/results explicitly until it
-  can copy their bytes before process exit.
+- expose aggregate, vector, option, result, record, or document handles as host
+  values. Those boundaries remain explicitly rejected until each has a bounded
+  copy/validation protocol.
 
 ## Depends on
 
