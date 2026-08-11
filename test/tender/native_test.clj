@@ -283,3 +283,27 @@
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown native session"
                         (executor/invoke {:format :kotoba.native-session/v0}
                                          {} {:args []} {:now 1500}))))
+
+(deftest the-reviewed-loader-source-can-be-named-rather-than-assumed
+  ;; It was read as `tools/kexe_loader.c` relative to the working directory,
+  ;; so the native host worked in exactly one repository -- the one that owns
+  ;; the file -- and every other caller got a NoSuchFileException naming a
+  ;; path it had no way to influence.
+  (let [locate @#'executor/loader-source-file
+        directory (doto (java.io.File. (System/getProperty "java.io.tmpdir")
+                                       (str "kotoba-loader-source-" (System/nanoTime)))
+                    (.mkdirs))
+        source (java.io.File. directory "kexe_loader.c")]
+    (try
+      (spit source "int main(void) { return 0; }\n")
+      (is (= (.getCanonicalPath source)
+             (.getCanonicalPath ^java.io.File (locate false (.getPath directory)))))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"loader source was not found"
+                            (locate false (.getPath (java.io.File. directory "absent"))))
+          "a named directory that does not hold it is an error, not a fallback")
+      (is (not= (.getCanonicalPath source)
+                (try (.getCanonicalPath ^java.io.File (locate true (.getPath directory)))
+                     (catch clojure.lang.ExceptionInfo _ ::refused)))
+          "the Windows loader is a different file and is not substituted for")
+      (finally
+        (doseq [file (reverse (file-seq directory))] (clojure.java.io/delete-file file true))))))
