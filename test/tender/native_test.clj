@@ -76,6 +76,8 @@
     (is (= 7 (host-result :i64 {:result 7})))
     (is (true? (host-result :bool {:result 1})))
     (is (false? (host-result :bool {:result 0})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"bool result is not 0/1"
+                          (host-result :bool {:result 2})))
     (is (= "hi😀" (host-result :string {:result-utf8-hex "6869f09f9880"})))
     (is (= {:left -7 :ready true}
            (host-result record-type {:result-words [-7 1]})))
