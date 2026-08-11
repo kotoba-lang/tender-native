@@ -8,7 +8,7 @@
          :git/sha "931f13e11113b5a348e308d845594836a7754d36"}
         io.github.kotoba-lang/kotoba-verifier
         {:git/url "https://github.com/kotoba-lang/kotoba-verifier.git"
-         :git/sha "ef5d93d628d33b3101e6e487c6eed22f19e19a01"}}
+         :git/sha "83057552f03a8021c6523e8e38ad7439b1953522"}}
  :aliases {:test {:extra-paths ["test"]
                   :extra-deps {io.github.cognitect-labs/test-runner
                                {:git/url "https://github.com/cognitect-labs/test-runner.git"

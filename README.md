@@ -28,13 +28,20 @@ checkable from outside.
   `[ok? value]`). The loader materializes and inspects the established
   `pair(tag,payload)` representation; tags must be boolean words and option
   none must carry payload zero.
+- Scalar variants keep the canonical KIR host value
+  `[type case-keyword payload]`. Qualified descriptors with 1--32 unique cases
+  and only `:i64`/`:bool` payloads lower to a bounded token containing case
+  count, declaration ordinal, payload kind, and word. Results are copied from
+  the pair arena as ordinal/word evidence, then reconstructed only after the
+  sealed descriptor validates the ordinal and boolean word.
 
 ## Does not own
 
 - compile
 - decide grants
 - require Rust in the core path
-- expose nested aggregate, vector, parametric option/result, or document
+- expose nested aggregate, vector, parametric option/result, non-scalar
+  variant, or document
   handles as host
   values. Those boundaries remain explicitly rejected until each has a bounded
   copy/validation protocol.

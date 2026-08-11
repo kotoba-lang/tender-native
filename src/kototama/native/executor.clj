@@ -522,6 +522,27 @@
 (defn- record-field-count [type]
   (when (scalar-record-type? type) (count (nth type 2))))
 
+(defn- scalar-variant-type? [type]
+  (and (vector? type) (= 3 (count type)) (= :variant (first type))
+       (keyword? (second type)) (some? (namespace (second type)))
+       (let [cases (nth type 2)]
+         (and (vector? cases) (<= 1 (count cases) 32)
+              (every? #(and (vector? %) (= 2 (count %))
+                            (keyword? (first %))
+                            (contains? #{:i64 :bool} (second %)))
+                      cases)
+              (= (count cases) (count (distinct (map first cases))))))))
+
+(defn- variant-result-profile [type]
+  (when (scalar-variant-type? type)
+    (let [cases (nth type 2)
+          bool-mask (reduce (fn [mask [index [_ payload-type]]]
+                              (if (= :bool payload-type)
+                                (bit-or mask (bit-shift-left 1 index))
+                                mask))
+                            0 (map-indexed vector cases))]
+      (str "variant:" (count cases) ":" bool-mask))))
+
 (defn- runtime-environment
   ([host-os-value] (runtime-environment host-os-value :i64))
   ([host-os-value result-type]
@@ -545,7 +566,9 @@
      (contains? #{:option-i64 :result-i64} result-type)
      (assoc "KEXE_RESULT_TYPE" (name result-type))
      (scalar-record-type? result-type)
-     (assoc "KEXE_RESULT_TYPE" (str "record:" (record-field-count result-type))))))
+     (assoc "KEXE_RESULT_TYPE" (str "record:" (record-field-count result-type)))
+     (scalar-variant-type? result-type)
+     (assoc "KEXE_RESULT_TYPE" (variant-result-profile result-type)))))
 
 (def ^:private hex-digits "0123456789abcdef")
 
@@ -618,6 +641,28 @@
       :result-i64 (str (if (true? (first value)) "e:ok:" "e:err:")
                        (second value)))))
 
+(defn- variant-argument-token [entry index type value]
+  (let [cases (nth type 2)
+        valid-shape? (and (vector? value) (= 3 (count value))
+                          (= type (first value)) (keyword? (second value)))
+        ordinal (when valid-shape?
+                  (first (keep-indexed (fn [position [case-name _]]
+                                         (when (= case-name (second value)) position))
+                                       cases)))
+        payload-type (when (some? ordinal) (second (nth cases ordinal)))
+        payload (when valid-shape? (nth value 2))
+        valid-payload? (case payload-type
+                         :i64 (signed-i64? payload)
+                         :bool (boolean? payload)
+                         false)]
+    (when-not (and valid-shape? (some? ordinal) valid-payload?)
+      (throw (ex-info "execution input does not match scalar variant"
+                      {:phase :execute :entry entry :index index
+                       :expected type})))
+    (str "v:" (count cases) ":" ordinal ":"
+         (if (= :bool payload-type) "b" "i") ":"
+         (if (= :bool payload-type) (if payload 1 0) payload))))
+
 (defn- decode-utf8-hex [value]
   (when (and (string? value) (even? (count value))
              (boolean (re-matches #"[0-9a-f]*" value)))
@@ -642,6 +687,7 @@
         tagged-result? (and (= status :ok)
                             (contains? #{:option-i64 :result-i64}
                                        (:result-type report)))
+        variant-result? (and (= status :ok) (= :variant (:result-type report)))
         expected-keys (case status
                         :ok (cond
                               string-result?
@@ -650,6 +696,9 @@
                               #{:status :result :result-type :result-words :fuel :heap}
                               tagged-result?
                               #{:status :result :result-type :result-tag :result-word
+                                :fuel :heap}
+                              variant-result?
+                              #{:status :result :result-type :result-ordinal :result-word
                                 :fuel :heap}
                               :else #{:status :result :fuel :heap})
                         :trap #{:status :exit :fuel :heap}
@@ -680,7 +729,11 @@
                   (signed-i64? (:result-word report))
                   (or (not= :option-i64 (:result-type report))
                       (:result-tag report)
-                      (zero? (:result-word report))))))))
+                      (zero? (:result-word report)))))
+         (or (not variant-result?)
+             (and (integer? (:result-ordinal report))
+                  (<= 0 (:result-ordinal report) 31)
+                  (signed-i64? (:result-word report)))))))
 
 (defn- entry-contract
   "Return the selected export's typed function boundary.
@@ -730,6 +783,7 @@
                   (contains? #{:option-i64 :result-i64} type)
                   (tagged-i64-argument-token entry index type value)
                   (scalar-record-type? type) (record-argument-token entry index type value)
+                  (scalar-variant-type? type) (variant-argument-token entry index type value)
                   :else
                   (throw (ex-info "native execution host does not support entry parameter type"
                                   {:phase :execute :entry entry :index index :type type}))))
@@ -740,14 +794,18 @@
                                       (quot (- (count token) 2) 2)
                                       0))
                                   param-types marshalled))
-        record-cells (reduce + 0 (keep record-field-count param-types))]
+        pair-cells (reduce + 0
+                           (map #(cond (scalar-record-type? %) (record-field-count %)
+                                       (scalar-variant-type? %) 1
+                                       :else 0)
+                                param-types))]
     (when (> string-bytes 65536)
       (throw (ex-info "execution string inputs exceed native host arena"
                       {:phase :execute :entry entry :bytes string-bytes
                        :limit-bytes 65536})))
-    (when (> record-cells 4096)
-      (throw (ex-info "execution record inputs exceed native pair arena"
-                      {:phase :execute :entry entry :cells record-cells
+    (when (> pair-cells 4096)
+      (throw (ex-info "execution aggregate inputs exceed native pair arena"
+                      {:phase :execute :entry entry :cells pair-cells
                        :limit-cells 4096})))
     marshalled))
 
@@ -759,7 +817,8 @@
   ;; validation story.
   (when-not (or (contains? #{:i64 :bool :string :option-i64 :result-i64}
                            result-type)
-                (scalar-record-type? result-type))
+                (scalar-record-type? result-type)
+                (scalar-variant-type? result-type))
     (throw (ex-info "native execution host does not support entry result type"
                     {:phase :execute :entry entry :type result-type}))))
 
@@ -779,6 +838,22 @@
     (if (:result-tag report) [true (:result-word report)] [false])
     (= :result-i64 result-type)
     [(:result-tag report) (:result-word report)]
+    (scalar-variant-type? result-type)
+    (let [ordinal (:result-ordinal report)
+          cases (nth result-type 2)]
+      (when-not (and (integer? ordinal) (<= 0 ordinal) (< ordinal (count cases)))
+        (throw (ex-info "native variant result ordinal is outside descriptor"
+                        {:phase :execute :ordinal ordinal :case-count (count cases)})))
+      (let [[case-name payload-type] (nth cases ordinal)
+            word (:result-word report)
+            payload (case payload-type
+                      :i64 word
+                      :bool (if (contains? #{0 1} word)
+                              (= 1 word)
+                              (throw (ex-info "native variant bool payload is not 0/1"
+                                              {:phase :execute :case case-name
+                                               :word word}))))]
+        [result-type case-name payload]))
     (scalar-record-type? result-type)
     (let [fields (nth result-type 2)
           words (:result-words report)]
