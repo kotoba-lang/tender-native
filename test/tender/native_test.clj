@@ -27,7 +27,11 @@
         result-ok {:status :ok :result 11 :result-type :result-i64
                    :result-tag false :result-word Long/MAX_VALUE
                    :fuel {:initial 512 :remaining 496}
-                   :heap {:capacity 4096 :used 36}}]
+                   :heap {:capacity 4096 :used 36}}
+        variant-ok {:status :ok :result 12 :result-type :variant
+                    :result-ordinal 1 :result-word 1
+                    :fuel {:initial 512 :remaining 495}
+                    :heap {:capacity 4096 :used 37}}]
     (is (true? (valid? ok 0)))
     (is (true? (valid? string-ok 0)))
     (is (false? (valid? (assoc string-ok :result-utf8-hex "ff") 0)))
@@ -44,6 +48,10 @@
     (is (true? (valid? result-ok 0)))
     (is (false? (valid? (assoc result-ok :result-word true) 0)))
     (is (false? (valid? (assoc result-ok :tag :err) 0)))
+    (is (true? (valid? variant-ok 0)))
+    (is (false? (valid? (assoc variant-ok :result-ordinal 32) 0)))
+    (is (false? (valid? (assoc variant-ok :result-word true) 0)))
+    (is (false? (valid? (assoc variant-ok :result-case :ready) 0)))
     (is (false? (valid? (assoc-in ok [:fuel :remaining] 513) 0)))
     (is (false? (valid? (assoc ok :ambient "forbidden") 0)))
     (is (false? (valid? ok 1)))))
@@ -87,6 +95,8 @@
 
 (deftest selected-export-result-is-boxed-or-refused-by-type
   (let [record-type [:record :maturity/pair [[:left :i64] [:ready :bool]]]
+        variant-type [:variant :maturity/outcome
+                      [[:count :i64] [:ready :bool]]]
         admit! @#'executor/admit-entry-result!
         host-result @#'executor/host-result]
     (is (= 7 (host-result :i64 {:result 7})))
@@ -106,6 +116,17 @@
            (host-result :result-i64 {:result-tag false :result-word -9})))
     (is (= {:left -7 :ready true}
            (host-result record-type {:result-words [-7 1]})))
+    (is (= [variant-type :count Long/MIN_VALUE]
+           (host-result variant-type
+                        {:result-ordinal 0 :result-word Long/MIN_VALUE})))
+    (is (= [variant-type :ready true]
+           (host-result variant-type {:result-ordinal 1 :result-word 1})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"ordinal is outside"
+                          (host-result variant-type
+                                       {:result-ordinal 2 :result-word 0})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"bool payload is not 0/1"
+                          (host-result variant-type
+                                       {:result-ordinal 1 :result-word 2})))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"field count mismatch"
                           (host-result record-type {:result-words [-7]})))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"bool field is not 0/1"
@@ -116,6 +137,7 @@
     (is (nil? (admit! 'maybe :option-i64)))
     (is (nil? (admit! 'outcome :result-i64)))
     (is (nil? (admit! 'pair record-type)))
+    (is (nil? (admit! 'outcome variant-type)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"result type"
                           (admit! 'measure :f64)))))
 
@@ -163,3 +185,26 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"tagged i64 value"
                             (marshal 'result [:result-i64] [bad]))
           (pr-str bad)))))
+
+(deftest scalar-variant-host-values-use-sealed-type-case-and-payload
+  (let [type [:variant :maturity/outcome [[:count :i64] [:ready :bool]]]
+        marshal @#'executor/marshal-entry-arguments]
+    (is (= ["v:2:0:i:-9223372036854775808" "v:2:1:b:1"]
+           (marshal 'choose [type type]
+                    [[type :count Long/MIN_VALUE] [type :ready true]])))
+    (doseq [bad [[[:variant :maturity/other [[:count :i64]]] :count 1]
+                 [type :missing 1]
+                 [type :count true]
+                 [type :ready 1]
+                 [type :count 1 :extra]
+                 {:case :count :payload 1}]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scalar variant"
+                            (marshal 'choose [type] [bad]))
+          (pr-str bad)))))
+
+(deftest scalar-variant-result-profile-seals-count-and-bool-mask
+  (let [environment @#'executor/runtime-environment
+        type [:variant :maturity/outcome
+              [[:count :i64] [:ready :bool] [:other :i64] [:done :bool]]]]
+    (is (= "variant:4:10"
+           (get (environment :linux type) "KEXE_RESULT_TYPE")))))
