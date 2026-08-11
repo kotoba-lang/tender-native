@@ -874,36 +874,76 @@
                  fields words)))
     :else (:result report)))
 
-(defn execute
-  "Verify and execute a signed native artifact. Returns measured supervisor evidence."
-  [envelope trust policy input {:keys [now entry runtime loader-path]}]
+(defn- admit-validity!
+  "Re-check the part of trust that can change while a session is open.
+
+  `prepare` verifies the signature and the artifact once. Those facts are
+  time-invariant: the same bytes carry the same signature no matter when they
+  are read, and the staged copy under the session directory is the one that
+  runs. Expiry, not-before, and the two revocation lists are NOT time-
+  invariant, so every invocation re-checks them against its own `now` against
+  the trust the session was opened with. Amortizing THESE is the change that
+  would actually weaken the boundary, so it is not amortized."
+  [{:keys [statement trust]} now]
+  (let [{:keys [signer not-before expires artifact-sha256]} statement]
+    (when (contains? (set (:revoked-signers trust)) signer)
+      (throw (ex-info "signer is revoked" {:phase :trust :signer signer})))
+    (when (contains? (set (:revoked-artifacts trust)) artifact-sha256)
+      (throw (ex-info "artifact is revoked"
+                      {:phase :trust :artifact artifact-sha256})))
+    (when (< now not-before)
+      (throw (ex-info "signature is not yet valid"
+                      {:phase :trust :not-before not-before :now now})))
+    (when (>= now expires)
+      (throw (ex-info "signature is expired"
+                      {:phase :trust :expires expires :now now})))))
+
+(defn prepare
+  "Verify a signed native artifact once and stage its measured execution
+  environment. Returns a session usable for many `invoke` calls.
+
+  WHY THIS EXISTS
+
+  `execute` verifies on every call, and verification is not cheap: the
+  signature check is small, but `verify-artifact!` re-validates the whole
+  sealed artifact, which for a 19k-word module measured 1.7-3.6 s on an M4
+  while the program itself runs in microseconds and the loader process costs
+  about 2 ms over a bare spawn. A host that calls a Kotoba decision more than
+  once therefore paid three orders of magnitude more for re-reading the
+  artifact than for running it, which is why callers reached for the
+  interpreter instead and native stayed a conformance target rather than an
+  execution path.
+
+  WHAT IS AMORTIZED, AND WHAT IS NOT
+
+  Amortized (time-invariant, and the staged bytes cannot change underneath a
+  session because the session owns them):
+    - Ed25519 signature and statement/artifact agreement
+    - `verify-artifact!` structural verification of the sealed artifact
+    - loader binary measurement against the runtime identity
+    - host/artifact/runtime target-profile agreement
+    - writing the measured loader and `program.bin` into the session directory
+
+  Not amortized -- `invoke` re-checks each of these per call:
+    - expiry, not-before, revoked signers, revoked artifacts (`admit-validity!`)
+    - capability admission of the artifact's effects against THAT call's policy
+    - argument marshalling and result-type admission
+
+  The session directory holds only the measured loader and the verified code;
+  `close!` removes it. A session is not serializable and must not outlive the
+  process that opened it."
+  [envelope trust {:keys [now runtime loader-path]}]
   (let [{artifact :artifact signer :signer} (signing/verify envelope trust now)
         host-backend (host-target)
         host-os-value (host-os)
         artifact-backend (target-profile/backend (:target artifact))
         artifact-profile (:target-profile artifact)
-        runtime-profile (:target-profile runtime)
-        entry (or entry 'main)
-        export (get (:exports artifact) entry)
-        args (:args input)]
-    (admission/check {:effects (:effects artifact)} policy)
+        runtime-profile (:target-profile runtime)]
     (when-not (and (= host-backend artifact-backend)
                    (contains? #{:unspecified host-os-value} (:os artifact-profile)))
       (throw (ex-info "artifact target does not match execution host"
                       {:phase :execute :artifact-target (:target artifact)
                        :host-target host-backend})))
-    (when-not export
-      (throw (ex-info "unknown native entry" {:phase :execute :entry entry})))
-    (let [{:keys [param-types result]} (entry-contract artifact entry)]
-    (when-not (map? input)
-      (throw (ex-info "execution input does not match entry arguments (entry arity)"
-                      {:phase :execute :entry entry :arity (:arity export)})))
-    (when-not (= (:arity export) (count param-types))
-      (throw (ex-info "native export arity disagrees with sealed KIR"
-                      {:phase :execute :entry entry :export-arity (:arity export)
-                       :kir-arity (count param-types)})))
-    (let [args (marshal-entry-arguments entry param-types args)]
-      (admit-entry-result! entry result)
     (when-not (= (target-profile/profile (explicit-host-target)) runtime-profile)
       (throw (ex-info "runtime target profile does not match execution host"
                       {:phase :runtime-identity})))
@@ -931,22 +971,72 @@
             code-file (io/file directory "program.bin")
             loader (io/file directory (if (= :windows host-os-value)
                                         "kexe-loader.exe" "kexe-loader"))]
-      (try
-        (with-open [out (io/output-stream loader)]
-          (.write out ^bytes loader-bytes))
-        (when-not (or (= :windows host-os-value) (.setExecutable loader true true))
-          (throw (ex-info "cannot make measured loader executable"
-                          {:phase :execute})))
-        (with-open [out (io/output-stream code-file)]
-          (.write out ^bytes (byte-array (map unchecked-byte (:code artifact)))))
+        (try
+          (with-open [out (io/output-stream loader)]
+            (.write out ^bytes loader-bytes))
+          (when-not (or (= :windows host-os-value) (.setExecutable loader true true))
+            (throw (ex-info "cannot make measured loader executable"
+                            {:phase :execute})))
+          (with-open [out (io/output-stream code-file)]
+            (.write out ^bytes (byte-array (map unchecked-byte (:code artifact)))))
+          {:format :kotoba.native-session/v1
+           :artifact artifact
+           :signer signer
+           :trust trust
+           :statement (:statement envelope)
+           :runtime runtime
+           :target (:target artifact)
+           :host-backend host-backend
+           :host-os host-os-value
+           :directory directory
+           :code-file code-file
+           :loader loader}
+          (catch Throwable failure
+            (delete-tree! directory)
+            (throw failure)))))))
+
+(defn close!
+  "Remove a session's staged loader and code. Idempotent."
+  [session]
+  (when-let [directory (:directory session)]
+    (delete-tree! directory))
+  nil)
+
+(defn invoke
+  "Execute one export of a prepared session. Returns measured supervisor
+  evidence in the same shape `execute` returns."
+  [session policy input {:keys [now entry]}]
+  (let [{:keys [artifact runtime host-backend host-os code-file loader]} session
+        entry (or entry 'main)
+        export (get (:exports artifact) entry)
+        args (:args input)]
+    (when-not (= :kotoba.native-session/v1 (:format session))
+      (throw (ex-info "unknown native session" {:phase :execute})))
+    (admit-validity! session now)
+    (admission/check {:effects (:effects artifact)} policy)
+    (when-not export
+      (throw (ex-info "unknown native entry" {:phase :execute :entry entry})))
+    (let [{:keys [param-types result]} (entry-contract artifact entry)]
+      (when-not (map? input)
+        (throw (ex-info "execution input does not match entry arguments (entry arity)"
+                        {:phase :execute :entry entry :arity (:arity export)})))
+      (when-not (= (:arity export) (count param-types))
+        (throw (ex-info "native export arity disagrees with sealed KIR"
+                        {:phase :execute :entry entry :export-arity (:arity export)
+                         :kir-arity (count param-types)})))
+      (let [args (marshal-entry-arguments entry param-types args)]
+        (admit-entry-result! entry result)
+        (when-not (and (.isFile ^java.io.File code-file)
+                       (.isFile ^java.io.File loader))
+          (throw (ex-info "native session is closed" {:phase :execute})))
         (let [isa (if (= host-backend :x86_64-kotoba-v1) "x86_64" "aarch64")
               allow (let [ids (allowed-capabilities policy)] (if (empty? ids) "-" ids))
-              command (into [(.getPath loader) (.getPath code-file)
+              command (into [(.getPath ^java.io.File loader) (.getPath ^java.io.File code-file)
                              (str (:offset export)) (str (:arity export)) isa allow]
                             (map str args))
               started-at (quot (System/currentTimeMillis) 1000)
-              process (run-process command (runtime-environment host-os-value result)
-                                   {:timeout-ms (if (= :windows host-os-value) 60000 5000)
+              process (run-process command (runtime-environment host-os result)
+                                   {:timeout-ms (if (= :windows host-os) 60000 5000)
                                     :output-limit (if (= :string result) 160000 65536)})
               finished-at (quot (System/currentTimeMillis) 1000)
               report (edn/read-string (str/trim (:stdout process)))
@@ -981,7 +1071,25 @@
                          (= status :ok)
                          (assoc :result (host-result result report))
                          trap (assoc :trap trap))]
-          {:artifact artifact :signer signer :target (:target artifact) :entry entry
-           :input input :evidence evidence :report report
-           :started-at started-at :finished-at finished-at})
-        (finally (delete-tree! directory)))))))))
+          {:artifact artifact :signer (:signer session) :target (:target artifact)
+           :entry entry :input input :evidence evidence :report report
+           :started-at started-at :finished-at finished-at})))))
+
+(defn execute
+  "Verify and execute a signed native artifact. Returns measured supervisor
+  evidence.
+
+  This is `prepare` + one `invoke` + `close!`. A caller that runs one entry
+  once should keep using it. A caller that runs many should hold the session,
+  because what this composition pays for is verifying the artifact again for
+  every call.
+
+  One ordering note for callers reading error phases: capability admission now
+  runs after the host/runtime target checks rather than before them, because
+  the target checks belong to opening the session and admission belongs to the
+  call. Both still refuse; only which refusal is reported first can differ."
+  [envelope trust policy input opts]
+  (let [session (prepare envelope trust opts)]
+    (try
+      (invoke session policy input opts)
+      (finally (close! session)))))

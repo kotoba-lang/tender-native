@@ -35,6 +35,21 @@ checkable from outside.
   the pair arena as ordinal/word evidence, then reconstructed only after the
   sealed descriptor validates the ordinal and boolean word.
 
+- The session boundary. `prepare` verifies a signed artifact once and stages
+  the measured loader and its code; `invoke` runs one export against that
+  staging; `close!` removes it. `execute` is those three composed, and stays
+  the right call for a host that runs one entry once.
+
+  What a session amortizes is time-invariant: the Ed25519 signature, the
+  `verify-artifact!` structural check, the loader measurement, and the
+  target-profile agreement. What it does not amortize is everything that can
+  change between two calls -- expiry, not-before, revoked signers, revoked
+  artifacts, and capability admission against that call's policy all run per
+  `invoke`. Measured on an M4, verification of a 19k-word module costs
+  1.7--3.6 s while the loader process costs about 2 ms over a bare spawn, so
+  the split is the difference between native being an execution path and
+  native being a conformance target.
+
 ## Does not own
 
 - compile

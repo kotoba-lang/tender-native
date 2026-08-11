@@ -208,3 +208,78 @@
               [[:count :i64] [:ready :bool] [:other :i64] [:done :bool]]]]
     (is (= "variant:4:10"
            (get (environment :linux type) "KEXE_RESULT_TYPE")))))
+
+;; ---------------------------------------------------------------------------
+;; Sessions: what a session amortizes, and what it must not.
+;;
+;; `prepare` verifies once so a host can call a Kotoba decision more than once
+;; without paying `verify-artifact!` every time. The value of that is only
+;; defensible if the checks that CAN change between two calls still run on
+;; every call, so those are pinned here rather than left to the docstring.
+
+(def ^:private open-session
+  {:format :kotoba.native-session/v1
+   :statement {:signer "signer-a"
+               :artifact-sha256 "artifact-a"
+               :not-before 1000
+               :expires 2000}
+   :trust {:trusted-signers #{"signer-a"}
+           :revoked-signers #{}
+           :revoked-artifacts #{}}})
+
+(deftest a-session-recheks-time-and-revocation-on-every-invocation
+  (let [admit! @#'executor/admit-validity!]
+    (is (nil? (admit! open-session 1500)))
+    (is (nil? (admit! open-session 1000)) "not-before is inclusive")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not yet valid"
+                          (admit! open-session 999)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expired"
+                          (admit! open-session 2000))
+        "expiry is exclusive, as it is in signing/verify")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"signer is revoked"
+                          (admit! (assoc-in open-session [:trust :revoked-signers]
+                                            #{"signer-a"})
+                                  1500)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"artifact is revoked"
+                          (admit! (assoc-in open-session [:trust :revoked-artifacts]
+                                            #{"artifact-a"})
+                                  1500)))))
+
+(defn- fake-session [directory]
+  (merge open-session
+         {:artifact {:effects #{}
+                     :target :aarch64-kotoba-v1
+                     :exports {'identity {:offset 0 :arity 1}}
+                     :program {:functions [{:name 'identity
+                                            :params ['value]
+                                            :param-types [:i64]
+                                            :result :i64}]}}
+          :signer "signer-a"
+          :runtime {}
+          :target :aarch64-kotoba-v1
+          :host-backend :aarch64-kotoba-v1
+          :host-os :macos
+          :directory directory
+          :code-file (java.io.File. directory "program.bin")
+          :loader (java.io.File. directory "kexe-loader")}))
+
+(deftest a-closed-session-refuses-to-run-rather-than-spawning-something-else
+  ;; The staged loader and code ARE the verified artifact for the life of a
+  ;; session. Once `close!` has removed them there is nothing left that was
+  ;; verified, so an invocation must refuse instead of reaching a path that
+  ;; would execute whatever happens to be at those names.
+  (let [directory (doto (java.io.File. (System/getProperty "java.io.tmpdir")
+                                       (str "kotoba-session-test-" (System/nanoTime)))
+                    (.mkdirs))
+        session (fake-session directory)]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"native session is closed"
+                          (executor/invoke session {} {:args [1]}
+                                           {:now 1500 :entry 'identity})))
+    (is (nil? (executor/close! session)))
+    (is (nil? (executor/close! session)) "close! is idempotent")
+    (is (not (.exists directory)))))
+
+(deftest an-invocation-names-the-session-format-it-accepts
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown native session"
+                        (executor/invoke {:format :kotoba.native-session/v0}
+                                         {} {:args []} {:now 1500}))))
