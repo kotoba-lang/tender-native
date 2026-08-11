@@ -23,13 +23,19 @@ checkable from outside.
   keyword keys, supports only unique `:i64`/`:bool` fields (1–128), and the
   loader requires the exact chain length and zero terminator before copying
   field words into evidence. Pair handles never escape to callers.
+- `:option-i64` and `:result-i64` use the same canonical tagged vectors as the
+  reference and restricted-ESM hosts (`[false]`/`[true value]` and
+  `[ok? value]`). The loader materializes and inspects the established
+  `pair(tag,payload)` representation; tags must be boolean words and option
+  none must carry payload zero.
 
 ## Does not own
 
 - compile
 - decide grants
 - require Rust in the core path
-- expose nested aggregate, vector, option, result, or document handles as host
+- expose nested aggregate, vector, parametric option/result, or document
+  handles as host
   values. Those boundaries remain explicitly rejected until each has a bounded
   copy/validation protocol.
 
