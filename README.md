@@ -1,12 +1,20 @@
 # tender-native
 
-Native tender — loads and runs kotoba-native artifacts under a capability gate.
+Kototama's **native host** — loads and runs artifacts that
+[`amu`](https://github.com/kotoba-lang/amu) wove through
+[`kotoba-native`](https://github.com/kotoba-lang/kotoba-native), under a
+capability gate.
 
-**Tier**: `T3`  **Role**: `runtime`
+The GitHub name still says `tender-native`. That is a historical alias for
+the Solo5 attendant-host role. The product is
+[`kototama`](https://github.com/kotoba-lang/kototama) (言霊). Namespace:
+`kototama.native.executor`. See root ADR-2608139980.
+
+**Tier**: `T3`  **Role**: `host` of kototama
 
 Split out of the overloaded core repos by ADR-2607266000 so that each
 responsibility has exactly one owner and the dependency direction is
-checkable from outside.
+checkable from outside. Do not merge this tree back into kototama core.
 
 ## Owns
 
