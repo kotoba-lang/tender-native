@@ -3,7 +3,7 @@
 ;; verify which contract it claims to satisfy. ADR-2607266000.
 {:schema "kotoba.repository-role-rules.v0"
  :this-repo
- {:name "tender-native"
+ {:name "kototama-native"
   :tier :t3
   :role :runtime
   :must-not [:compile :decide-grants :require-Rust-in-the-core-path]

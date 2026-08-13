@@ -1,14 +1,13 @@
-# tender-native
+# kototama-native
 
 Kototama's **native host** — loads and runs artifacts that
 [`amu`](https://github.com/kotoba-lang/amu) wove through
 [`kotoba-native`](https://github.com/kotoba-lang/kotoba-native), under a
 capability gate.
 
-The GitHub name still says `tender-native`. That is a historical alias for
-the Solo5 attendant-host role. The product is
-[`kototama`](https://github.com/kotoba-lang/kototama) (言霊). Namespace:
-`kototama.native.executor`. See root ADR-2608139980.
+GitHub id `1312673399`. Previously `tender-native`; that URL still redirects.
+The product is [`kototama`](https://github.com/kotoba-lang/kototama) (言霊).
+Namespace: `kototama.native.executor`. See root ADR-2608139980.
 
 **Tier**: `T3`  **Role**: `host` of kototama
 
